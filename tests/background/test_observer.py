@@ -13,6 +13,7 @@ import pytest
 from ductor_bot.background.models import BackgroundResult, BackgroundSubmit
 from ductor_bot.background.observer import MAX_TASKS_PER_CHAT, BackgroundObserver
 from ductor_bot.cli.param_resolver import TaskExecutionConfig
+from ductor_bot.cli.types import AgentResponse
 from ductor_bot.cron.execution import OneShotExecutionResult
 from ductor_bot.infra.task_runner import TaskResult
 from ductor_bot.workspace.paths import DuctorPaths
@@ -268,3 +269,33 @@ class TestCleanup:
             await asyncio.sleep(0.05)
 
         assert len(observer.active_tasks(123)) == 0
+
+
+class TestNamedSessions:
+    async def test_named_session_planner_mode_appends_overlay(self, paths: DuctorPaths) -> None:
+        cli_service = AsyncMock()
+        cli_service.execute = AsyncMock(return_value=AgentResponse(result="ok", session_id="sid-1"))
+        observer = BackgroundObserver(paths, timeout_seconds=30.0, cli_service=cli_service)
+        observer.set_result_handler(AsyncMock())
+        config = _make_exec_config(provider="codex", model="gpt-5.2-codex")
+
+        observer.submit(
+            BackgroundSubmit(
+                chat_id=123,
+                prompt="plan it",
+                message_id=1,
+                thread_id=None,
+                session_name="planner",
+                resume_session_id="sid-1",
+                provider_override="codex",
+                model_override="gpt-5.2-codex",
+                planner_mode=True,
+            ),
+            config,
+        )
+        await asyncio.sleep(0.05)
+
+        request = cli_service.execute.call_args[0][0]
+        assert request.append_system_prompt is not None
+        assert "Planner mode is active." in request.append_system_prompt
+        await observer.shutdown()

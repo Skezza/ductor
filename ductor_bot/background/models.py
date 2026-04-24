@@ -18,6 +18,9 @@ class BackgroundSubmit:
     resume_session_id: str = ""
     provider_override: str = ""
     model_override: str = ""
+    working_dir: str = ""
+    source_kind: str = "ductor"
+    planner_mode: bool = False
 
 
 @dataclass(slots=True)
@@ -35,6 +38,9 @@ class BackgroundTask:
     asyncio_task: asyncio.Task[None] | None = field(default=None, repr=False)
     session_name: str = ""
     resume_session_id: str = ""
+    working_dir: str = ""
+    source_kind: str = "ductor"
+    planner_mode: bool = False
 
 
 @dataclass(slots=True)
@@ -53,3 +59,4 @@ class BackgroundResult:
     model: str
     session_name: str = ""
     session_id: str = ""
+    session_update: str = ""

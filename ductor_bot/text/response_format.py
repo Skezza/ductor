@@ -2,16 +2,115 @@
 
 from __future__ import annotations
 
+import re
+from collections.abc import Sequence
+
 from ductor_bot.i18n import t
 
 SEP = "\u2500\u2500\u2500"
 
 _SHELL_TOOLS = frozenset({"bash", "powershell", "cmd", "sh", "zsh", "shell"})
+_CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 
 
 def normalize_tool_name(name: str) -> str:
     """Normalize shell-related tool names to 'Shell' for display."""
     return "Shell" if name.lower() in _SHELL_TOOLS else name
+
+
+def _sentence_case(text: str) -> str:
+    """Upper-case the first character while leaving the rest untouched."""
+    return text[:1].upper() + text[1:] if text else text
+
+
+def _prettify_identifier(value: str) -> str:
+    """Convert camelCase/snake_case tool names into lower-case readable text."""
+    spaced = _CAMEL_BOUNDARY_RE.sub(" ", value.replace("_", " ").replace("-", " "))
+    return " ".join(spaced.split()).lower()
+
+
+def _tool_activity_phrase(name: str) -> str | None:
+    """Return a lower-case human label for a tool call."""
+    clean = name.strip()
+    if not clean:
+        return None
+
+    normalized = normalize_tool_name(clean)
+    key = _NON_ALNUM_RE.sub("", normalized.lower())
+    label_key: str | None = None
+    if key == "shell":
+        label_key = "footer.action_running_shell"
+    elif key in {"edit", "write", "filechange", "multiedit", "strreplace", "applypatch"}:
+        label_key = "footer.action_editing_files"
+    elif key in {"read", "view", "cat", "glob", "ls", "listdir", "listfiles"}:
+        label_key = "footer.action_reading_files"
+    elif key == "websearch":
+        label_key = "footer.action_searching_web"
+    elif key in {"todowrite", "todolist", "todolistwrite", "updateplan"}:
+        label_key = "footer.action_updating_plan"
+
+    if label_key is not None:
+        return t(label_key)
+
+    pretty = _prettify_identifier(normalized)
+    return t("footer.action_using_tool", tool=pretty) if pretty else None
+
+
+def tool_activity_text(name: str) -> str:
+    """Return a sentence-case label for live tool activity."""
+    phrase = _tool_activity_phrase(name)
+    return _sentence_case(phrase) if phrase else ""
+
+
+def tool_activity_summary(name: str) -> str | None:
+    """Return a lower-case summary label for action-footers."""
+    return _tool_activity_phrase(name)
+
+
+def _system_status_phrase(status: str | None) -> str | None:
+    """Return a lower-case human label for a raw system status token."""
+    if status is None:
+        return None
+
+    clean = status.strip()
+    if not clean:
+        return None
+
+    known = {
+        "thinking": t("footer.action_thinking"),
+        "compacting": t("footer.action_compacting_context"),
+        "recovering": t("footer.action_recovering_session"),
+        "timeout_warning": t("footer.action_approaching_timeout"),
+        "timeout_extended": t("footer.action_extended_timeout"),
+    }
+    if clean in known:
+        return known[clean]
+
+    pretty = _prettify_identifier(clean)
+    return pretty or None
+
+
+def system_status_text(status: str | None) -> str | None:
+    """Return a sentence-case label for live system status text."""
+    phrase = _system_status_phrase(status)
+    return _sentence_case(phrase) if phrase else None
+
+
+def system_status_summary(status: str | None) -> str | None:
+    """Return a lower-case summary label for action-footers."""
+    if status == "thinking":
+        return None
+    return _system_status_phrase(status)
+
+
+def format_action_footer(actions: Sequence[tuple[str, int]]) -> str:
+    """Format a terse final action trace footer."""
+    if not actions:
+        return ""
+
+    rendered = ", ".join(f"{name} x{count}" if count > 1 else name for name, count in actions)
+    return "\n---\n" + t("footer.actions", actions=rendered)
 
 
 def fmt(*blocks: str) -> str:

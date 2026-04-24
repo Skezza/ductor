@@ -12,6 +12,7 @@ from ductor_bot.cli.types import AgentResponse
 from ductor_bot.config import AgentConfig
 from ductor_bot.errors import CLIError, CronError, SessionError, StreamError, WorkspaceError
 from ductor_bot.orchestrator.core import Orchestrator
+from ductor_bot.orchestrator.planner import planner_append_prompt
 from ductor_bot.session.key import SessionKey
 from ductor_bot.workspace.paths import DuctorPaths
 
@@ -98,6 +99,132 @@ async def test_directive_with_text(orch: Orchestrator) -> None:
     request = mock_execute.call_args[0][0]
     assert request.model_override == "sonnet"
     assert request.prompt.startswith("Hello")
+
+
+async def test_plain_named_directive_no_longer_routes_to_named_session(orch: Orchestrator) -> None:
+    key = SessionKey(chat_id=1)
+    orch.import_codex_named_session(
+        key.chat_id,
+        session_id="sess-import-1",
+        working_dir=str(orch.paths.workspace),
+        thread_name="debugger",
+        prompt_preview="previous prompt",
+    )
+    mock_execute = AsyncMock(return_value=_mock_response())
+    object.__setattr__(orch._cli_service, "execute", mock_execute)
+
+    await orch.handle_message(key, "@debugger continue here")
+
+    request = mock_execute.call_args[0][0]
+    assert request.prompt.startswith("continue here")
+
+
+async def test_plan_command_enables_main_planner_and_executes_prompt(orch: Orchestrator) -> None:
+    key = SessionKey(chat_id=1)
+    await orch._sessions.set_provider_session_state(
+        key,
+        provider="codex",
+        model="gpt-5.2-codex",
+        session_id="codex-sid",
+        working_dir=str(orch.paths.workspace),
+    )
+    mock_execute = AsyncMock(return_value=_mock_response(session_id="codex-sid"))
+    object.__setattr__(orch._cli_service, "execute", mock_execute)
+
+    await orch.handle_message(key, "/plan sketch the migration")
+
+    request = mock_execute.call_args[0][0]
+    assert request.append_system_prompt is not None
+    assert "Planner mode is active." in request.append_system_prompt
+
+    active = await orch._sessions.get_active(key)
+    assert active is not None
+    assert active.planner_mode is True
+    assert active.planner_waiting is False
+
+
+async def test_plan_command_returns_status_when_already_enabled(orch: Orchestrator) -> None:
+    key = SessionKey(chat_id=1)
+    await orch._sessions.set_provider_session_state(
+        key,
+        provider="codex",
+        model="gpt-5.2-codex",
+        session_id="codex-sid",
+        working_dir=str(orch.paths.workspace),
+        planner_mode=True,
+    )
+    mock_execute = AsyncMock(return_value=_mock_response(session_id="codex-sid"))
+    object.__setattr__(orch._cli_service, "execute", mock_execute)
+
+    result = await orch.handle_message(key, "/plan refine the plan")
+
+    assert "Planner mode for this chat: on" in result.text
+    mock_execute.assert_not_awaited()
+
+
+async def test_implement_command_disables_main_planner_and_executes_normally(orch: Orchestrator) -> None:
+    key = SessionKey(chat_id=1)
+    await orch._sessions.set_provider_session_state(
+        key,
+        provider="codex",
+        model="gpt-5.2-codex",
+        session_id="codex-sid",
+        working_dir=str(orch.paths.workspace),
+        planner_mode=True,
+    )
+    mock_execute = AsyncMock(return_value=_mock_response(session_id="codex-sid"))
+    object.__setattr__(orch._cli_service, "execute", mock_execute)
+
+    await orch.handle_message(key, "/implement ship it")
+
+    request = mock_execute.call_args[0][0]
+    assert request.append_system_prompt is None
+
+    active = await orch._sessions.get_active(key)
+    assert active is not None
+    assert active.planner_mode is False
+
+
+async def test_plan_command_toggles_named_session_without_executing(orch: Orchestrator) -> None:
+    session = orch.import_codex_named_session(
+        1,
+        session_id="sess-import-1",
+        working_dir=str(orch.paths.workspace),
+        thread_name="planner",
+        prompt_preview="previous prompt",
+    )
+
+    result = await orch.handle_message(SessionKey(chat_id=1), f"/plan @{session.name}")
+
+    assert f"Planner mode for @{session.name}: on" in result.text
+    updated = orch.get_named_session(1, session.name)
+    assert updated is not None
+    assert updated.planner_mode is True
+
+
+async def test_implement_command_turns_off_named_planner_without_prompt(orch: Orchestrator) -> None:
+    session = orch.import_codex_named_session(
+        1,
+        session_id="sess-import-1",
+        working_dir=str(orch.paths.workspace),
+        thread_name="planner",
+        prompt_preview="previous prompt",
+    )
+    orch.named_sessions.set_planner_mode(1, session.name, True)
+
+    result = await orch.handle_message(SessionKey(chat_id=1), f"/implement @{session.name}")
+
+    assert f"Planner mode for @{session.name}: off" in result.text
+    updated = orch.get_named_session(1, session.name)
+    assert updated is not None
+    assert updated.planner_mode is False
+
+
+def test_codex_planner_prompt_requires_explicit_question_before_buttons() -> None:
+    prompt = planner_append_prompt("codex")
+    assert prompt is not None
+    assert "first ask one explicit question" in prompt
+    assert "Do not emit standalone [button:...] suggestions" in prompt
 
 
 # -- streaming --

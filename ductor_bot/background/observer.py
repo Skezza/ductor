@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 from ductor_bot.background.models import BackgroundResult, BackgroundSubmit, BackgroundTask
 from ductor_bot.i18n import t
 from ductor_bot.infra.task_runner import run_oneshot_task
+from ductor_bot.orchestrator.planner import planner_append_prompt
 
 if TYPE_CHECKING:
     from ductor_bot.cli.param_resolver import TaskExecutionConfig
@@ -24,6 +25,15 @@ logger = logging.getLogger(__name__)
 BgResultCallback = Callable[[BackgroundResult], Awaitable[None]]
 
 MAX_TASKS_PER_CHAT = 5
+_INVALID_SESSION_MARKERS = ("invalid session", "session not found")
+
+
+def _is_invalid_session_response(result_text: str, *, is_error: bool) -> bool:
+    """Return True when the provider rejected a resume session ID."""
+    if not is_error:
+        return False
+    lower = result_text.lower()
+    return any(marker in lower for marker in _INVALID_SESSION_MARKERS)
 
 
 class BackgroundObserver:
@@ -73,6 +83,9 @@ class BackgroundObserver:
             submitted_at=time.monotonic(),
             session_name=sub.session_name,
             resume_session_id=sub.resume_session_id,
+            working_dir=sub.working_dir,
+            source_kind=sub.source_kind,
+            planner_mode=sub.planner_mode,
         )
         atask = asyncio.create_task(self._run(bg_task, exec_config))
         bg_task.asyncio_task = atask
@@ -196,21 +209,35 @@ class BackgroundObserver:
         try:
             request = AgentRequest(
                 prompt=bg_task.prompt,
+                append_system_prompt=planner_append_prompt(bg_task.provider)
+                if bg_task.planner_mode
+                else None,
                 model_override=bg_task.model or None,
                 provider_override=bg_task.provider or None,
                 chat_id=bg_task.chat_id,
                 process_label=process_label,
                 resume_session=bg_task.resume_session_id or None,
+                working_dir_override=bg_task.working_dir or None,
+                allow_invalid_session_recovery=bg_task.source_kind != "codex_import",
                 timeout_seconds=self._timeout_seconds,
             )
             response = await self._cli_service.execute(request)
 
             elapsed = time.monotonic() - t0
             status = "ok"
+            result_text = response.result or ""
+            session_update = "idle"
             if response.is_error:
                 status = "error:cli"
                 if response.timed_out:
                     status = "error:timeout"
+                if (
+                    bg_task.source_kind == "codex_import"
+                    and _is_invalid_session_response(result_text, is_error=response.is_error)
+                ):
+                    status = "error:invalid_import"
+                    result_text = t("session.import_unavailable")
+                    session_update = "end"
 
             await self._deliver(
                 BackgroundResult(
@@ -219,13 +246,14 @@ class BackgroundObserver:
                     message_id=bg_task.message_id,
                     thread_id=bg_task.thread_id,
                     prompt_preview=bg_task.prompt[:60],
-                    result_text=response.result or "",
+                    result_text=result_text,
                     status=status,
                     elapsed_seconds=elapsed,
                     provider=bg_task.provider,
                     model=bg_task.model,
                     session_name=bg_task.session_name,
                     session_id=response.session_id or "",
+                    session_update=session_update,
                 )
             )
         except asyncio.CancelledError:
@@ -244,6 +272,7 @@ class BackgroundObserver:
                         provider=bg_task.provider,
                         model=bg_task.model,
                         session_name=bg_task.session_name,
+                        session_update="idle",
                     )
                 )
             raise
@@ -266,6 +295,7 @@ class BackgroundObserver:
                         provider=bg_task.provider,
                         model=bg_task.model,
                         session_name=bg_task.session_name,
+                        session_update="idle",
                     )
                 )
 

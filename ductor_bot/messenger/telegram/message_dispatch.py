@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -17,6 +17,12 @@ from ductor_bot.messenger.telegram.streaming import create_stream_editor
 from ductor_bot.messenger.telegram.typing import TypingContext
 from ductor_bot.orchestrator.registry import OrchestratorResult
 from ductor_bot.session.key import SessionKey
+from ductor_bot.text.response_format import (
+    format_action_footer,
+    system_status_summary,
+    system_status_text,
+    tool_activity_summary,
+)
 
 if TYPE_CHECKING:
     from aiogram import Bot
@@ -41,6 +47,31 @@ def _build_footer(result: OrchestratorResult, scene: SceneConfig | None) -> str:
         result.cost_usd,
         result.duration_ms,
     )
+
+
+def _merge_footers(*footers: str) -> str:
+    """Join pre-formatted footers while preserving their existing separators."""
+    return "".join(footer for footer in footers if footer)
+
+
+@dataclass(slots=True)
+class _ActionTrace:
+    """Ordered action counts for the final Telegram transcript footer."""
+
+    counts: dict[str, int] = field(default_factory=dict)
+
+    def record_tool(self, tool_name: str) -> None:
+        label = tool_activity_summary(tool_name)
+        if label:
+            self.counts[label] = self.counts.get(label, 0) + 1
+
+    def record_status(self, status: str | None) -> None:
+        label = system_status_summary(status)
+        if label:
+            self.counts[label] = self.counts.get(label, 0) + 1
+
+    def footer(self) -> str:
+        return format_action_footer(list(self.counts.items()))
 
 
 @dataclass(slots=True)
@@ -101,6 +132,7 @@ async def run_streaming_message(
     """Execute one streaming turn and deliver text/files to Telegram."""
     logger.info("Streaming flow started")
 
+    action_trace = _ActionTrace()
     editor = create_stream_editor(
         dispatch.bot,
         dispatch.key.chat_id,
@@ -122,22 +154,16 @@ async def run_streaming_message(
         await coalescer.feed(delta)
 
     async def on_tool(tool_name: str) -> None:
+        action_trace.record_tool(tool_name)
         await coalescer.flush(force=True)
         await editor.append_tool(tool_name)
 
     async def on_system(status: str | None) -> None:
-        system_map: dict[str, str] = {
-            "thinking": "THINKING",
-            "compacting": "COMPACTING",
-            "recovering": "Please wait, recovering...",
-            "timeout_warning": "TIMEOUT APPROACHING",
-            "timeout_extended": "TIMEOUT EXTENDED",
-        }
-        label = system_map.get(status or "")
-        if label is None:
+        action_trace.record_status(status)
+        if system_status_text(status) is None:
             return
         await coalescer.flush(force=True)
-        await editor.append_system(label)
+        await editor.append_system(status or "")
 
     async with TypingContext(dispatch.bot, dispatch.key.chat_id, thread_id=dispatch.thread_id):
         result = await dispatch.orchestrator.handle_message_streaming(
@@ -150,7 +176,7 @@ async def run_streaming_message(
 
     await coalescer.flush(force=True)
     coalescer.stop()
-    footer = _build_footer(result, dispatch.scene_config)
+    footer = _merge_footers(action_trace.footer(), _build_footer(result, dispatch.scene_config))
     if footer:
         await editor.append_text(footer)
         result.text += footer

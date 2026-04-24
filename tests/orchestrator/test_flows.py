@@ -13,6 +13,7 @@ from ductor_bot.orchestrator.flows import (
     _finish_normal,
     _strip_ack_token,
     _update_session,
+    named_session_flow,
     normal,
     normal_streaming,
 )
@@ -659,3 +660,47 @@ async def test_normal_abort_on_new_session_returns_empty(orch: Orchestrator) -> 
 
     result = await normal(orch, SessionKey(chat_id=1), "Hello")
     assert result.text == ""
+
+
+async def test_imported_codex_session_invalid_resume_blocks_future_fallback(
+    orch: Orchestrator,
+) -> None:
+    key = SessionKey(chat_id=1)
+    await orch.attach_codex_import(key, session_id="imported-sid", working_dir=str(orch.paths.workspace))
+
+    invalid = _mock_response(is_error=True, result="invalid session")
+    mock_execute = AsyncMock(return_value=invalid)
+    object.__setattr__(orch._cli_service, "execute", mock_execute)
+
+    first = await normal(orch, key, "resume this imported session")
+    assert "Imported Codex Session Unavailable" in first.text
+    assert mock_execute.await_count == 1
+
+    mock_execute.reset_mock()
+    second = await normal(orch, key, "try again")
+    assert "Imported Codex Session Unavailable" in second.text
+    mock_execute.assert_not_awaited()
+
+
+async def test_imported_named_session_invalid_resume_ends_session(
+    orch: Orchestrator,
+) -> None:
+    session = orch.import_codex_named_session(
+        1,
+        session_id="imported-sid",
+        working_dir=str(orch.paths.workspace),
+        thread_name="Imported thread",
+        prompt_preview="preview text",
+    )
+    object.__setattr__(
+        orch._cli_service,
+        "execute",
+        AsyncMock(return_value=_mock_response(is_error=True, result="session not found")),
+    )
+
+    result = await named_session_flow(orch, SessionKey(chat_id=1), session.name, "follow up")
+
+    assert "Imported Codex Session Unavailable" in result.text
+    refreshed = orch._named_sessions.get(1, session.name)
+    assert refreshed is not None
+    assert refreshed.status == "ended"

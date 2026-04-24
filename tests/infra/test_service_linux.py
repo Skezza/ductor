@@ -43,6 +43,12 @@ class TestGenerateServiceUnit:
         assert f"{tmp_path}/.nvm/versions/node/v24.0.0/bin" in unit
         assert f"{tmp_path}/.nvm/versions/node/v22.0.0/bin" in unit
 
+    def test_includes_npm_global_bin(self, tmp_path: Path) -> None:
+        with patch("ductor_bot.infra.service_linux.Path.home", return_value=tmp_path):
+            unit = _generate_service_unit("ductor")
+
+        assert f"{tmp_path}/.npm-global/bin" in unit
+
 
 class TestIsServiceAvailable:
     @patch("ductor_bot.infra.service_linux.shutil.which", return_value="/usr/bin/systemctl")

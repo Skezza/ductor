@@ -29,6 +29,7 @@ from ductor_bot.infra.version import VersionInfo, get_current_version
 from ductor_bot.log_context import set_log_context
 from ductor_bot.messenger.notifications import NotificationService
 from ductor_bot.messenger.telegram.callbacks import (
+    build_button_followup_prompt,
     edit_selector_response,
     mark_button_choice,
     parse_ns_callback,
@@ -296,6 +297,30 @@ class TelegramBot:
             return False
         return is_command_for_others(message, self._bot_username)
 
+    @staticmethod
+    def _is_bot_command_message(message: Message) -> bool:
+        """Return True when Telegram marked this message as a bot command.
+
+        The generic ``message()`` handler is registered alongside explicit
+        command handlers, so we must ignore bot-command messages here to avoid
+        duplicate processing.
+        """
+        text = message.text or ""
+        entities = getattr(message, "entities", None) or ()
+        for entity in entities:
+            if getattr(entity, "type", "") == "bot_command" and getattr(entity, "offset", -1) == 0:
+                return True
+
+        head = text.strip().split(None, 1)[0] if text.strip() else ""
+        if not head.startswith("/"):
+            return False
+        command = head[1:]
+        if not command:
+            return False
+        if "@" in command:
+            command = command.split("@", 1)[0]
+        return command.replace("_", "").isalnum()
+
     def file_roots(self, paths: DuctorPaths) -> list[Path] | None:
         """Allowed root directories for ``<file:...>`` tag sends."""
         return resolve_allowed_roots(self._config.file_access, paths.workspace)
@@ -325,7 +350,7 @@ class TelegramBot:
         r.message(Command("tasks", ignore_case=True))(self._on_tasks)
         r.message(Command("showfiles", ignore_case=True))(self._on_showfiles)
         r.message(Command("agent_commands", ignore_case=True))(self._on_agent_commands)
-        base_cmds = ["status", "memory", "model", "cron", "diagnose", "upgrade"]
+        base_cmds = ["status", "memory", "model", "cron", "diagnose", "upgrade", "plan", "implement"]
         if self._agent_name == "main":
             base_cmds += ["agents", "agent_start", "agent_stop", "agent_restart"]
         for cmd in base_cmds:
@@ -936,6 +961,13 @@ class TelegramBot:
             return
 
         prompt = parts[1].strip()
+        logger.info(
+            "/session requested msg_id=%d chat=%d thread=%s preview=%s",
+            message.message_id,
+            chat_id,
+            thread_id if thread_id is not None else "-",
+            prompt[:80],
+        )
 
         # Parse optional @directive prefix:
         #   @provider [model] <prompt>    — e.g. @codex, @claude opus
@@ -967,6 +999,11 @@ class TelegramBot:
 
         try:
             if session_followup:
+                logger.info(
+                    "/session follow-up target=%s msg_id=%d",
+                    session_followup,
+                    message.message_id,
+                )
                 task_id = self._orch.submit_named_followup_bg(
                     chat_id, session_followup, prompt, message.message_id, thread_id
                 )
@@ -994,6 +1031,13 @@ class TelegramBot:
                     prompt,
                     ns_request,
                 )
+                logger.info(
+                    "/session started name=%s msg_id=%d provider=%s model=%s",
+                    session_name,
+                    message.message_id,
+                    provider_override or self._orch.config.provider,
+                    model_override or self._orch.config.model,
+                )
                 ns = self._orch.get_named_session(chat_id, session_name)
                 provider = ns.provider if ns else (provider_override or self._orch.config.provider)
                 model = ns.model if ns else ""
@@ -1008,7 +1052,7 @@ class TelegramBot:
                         f"**Session `{session_name}` started**",
                         SEP,
                         f"Running on {provider_label}{model_info}.\n"
-                        f"Follow up: `@{session_name} <message>`",
+                        f"Follow up: `/session @{session_name} <message>`",
                     ),
                     SendRichOpts(reply_to_message_id=message.message_id, thread_id=thread_id),
                 )
@@ -1080,51 +1124,58 @@ class TelegramBot:
 
         # Resolve display label before data gets rewritten
         display_label: str = data
+        use_resolved_prompt = False
         if is_welcome_callback(data):
             display_label = get_welcome_button_label(data) or data
             resolved = resolve_welcome_callback(data)
             if not resolved:
                 return
             data = resolved
+            use_resolved_prompt = True
 
-        if await self._route_special_callback(key, msg.message_id, data, thread_id=thread_id):
+        if await self._route_special_callback(key, msg, data, thread_id=thread_id):
             return
 
         await self._mark_button_choice(chat_id, msg, display_label)
+        prompt = (
+            data
+            if use_resolved_prompt
+            else build_button_followup_prompt(self._message_text_for_callback(msg), display_label)
+        )
 
         async with self._sequential.get_lock(key.lock_key):
             if self._config.streaming.enabled:
-                await self._handle_streaming(msg, key, data, thread_id=thread_id)
+                await self._handle_streaming(msg, key, prompt, thread_id=thread_id)
             else:
-                await self._handle_non_streaming(msg, key, data, thread_id=thread_id)
+                await self._handle_non_streaming(msg, key, prompt, thread_id=thread_id)
 
     async def _route_special_callback(
-        self, key: SessionKey, message_id: int, data: str, *, thread_id: int | None = None
+        self, key: SessionKey, msg: Message, data: str, *, thread_id: int | None = None
     ) -> bool:
         """Handle known callback namespaces. Returns True when handled."""
-        if await self._route_prefix_callback(key, message_id, data, thread_id=thread_id):
+        if await self._route_prefix_callback(key, msg, data, thread_id=thread_id):
             return True
 
         from ductor_bot.orchestrator.selectors.model_selector import is_model_selector_callback
 
         if is_model_selector_callback(data):
-            await self._handle_model_selector(key, message_id, data)
+            await self._handle_model_selector(key, msg.message_id, data)
             return True
 
         from ductor_bot.orchestrator.selectors.cron_selector import is_cron_selector_callback
 
         if is_cron_selector_callback(data):
-            await self._handle_cron_selector(key.chat_id, message_id, data)
+            await self._handle_cron_selector(key.chat_id, msg.message_id, data)
             return True
 
         if is_file_browser_callback(data):
-            await self._handle_file_browser(key, message_id, data, thread_id=thread_id)
+            await self._handle_file_browser(key, msg.message_id, data, thread_id=thread_id)
             return True
 
         return False
 
     async def _route_prefix_callback(
-        self, key: SessionKey, message_id: int, data: str, *, thread_id: int | None = None
+        self, key: SessionKey, msg: Message, data: str, *, thread_id: int | None = None
     ) -> bool:
         """Handle prefix-based callback namespaces. Returns True when handled."""
         chat_id = key.chat_id
@@ -1133,22 +1184,22 @@ class TelegramBot:
             return True
 
         if data.startswith("upg:"):
-            await self._handle_upgrade_callback(chat_id, message_id, data, thread_id=thread_id)
+            await self._handle_upgrade_callback(chat_id, msg.message_id, data, thread_id=thread_id)
             return True
 
         from ductor_bot.orchestrator.selectors.session_selector import is_session_selector_callback
         from ductor_bot.orchestrator.selectors.task_selector import is_task_selector_callback
 
         if is_session_selector_callback(data):
-            await self._handle_session_selector(chat_id, message_id, data)
+            await self._handle_session_selector(key, msg.message_id, data)
             return True
 
         if is_task_selector_callback(data):
-            await self._handle_task_selector(chat_id, message_id, data)
+            await self._handle_task_selector(chat_id, msg.message_id, data)
             return True
 
         if data.startswith("ns:"):
-            await self._handle_ns_callback(key, data, thread_id=thread_id)
+            await self._handle_ns_callback(key, msg, data, thread_id=thread_id)
             return True
 
         return False
@@ -1169,13 +1220,13 @@ class TelegramBot:
             resp = await handle_cron_callback(self._orch, data)
         await edit_selector_response(self._bot, chat_id, message_id, resp)
 
-    async def _handle_session_selector(self, chat_id: int, message_id: int, data: str) -> None:
+    async def _handle_session_selector(self, key: SessionKey, message_id: int, data: str) -> None:
         """Handle session selector wizard by editing the message in-place."""
         from ductor_bot.orchestrator.selectors.session_selector import handle_session_callback
 
-        async with self._sequential.get_lock(chat_id):
-            resp = await handle_session_callback(self._orch, chat_id, data)
-        await edit_selector_response(self._bot, chat_id, message_id, resp)
+        async with self._sequential.get_lock(key.lock_key):
+            resp = await handle_session_callback(self._orch, key, data)
+        await edit_selector_response(self._bot, key.chat_id, message_id, resp)
 
     async def _handle_task_selector(self, chat_id: int, message_id: int, data: str) -> None:
         """Handle task selector wizard by editing the message in-place."""
@@ -1188,34 +1239,63 @@ class TelegramBot:
         await edit_selector_response(self._bot, chat_id, message_id, resp)
 
     async def _handle_ns_callback(
-        self, key: SessionKey, data: str, *, thread_id: int | None = None
+        self,
+        key: SessionKey,
+        msg: Message,
+        data: str,
+        *,
+        thread_id: int | None = None,
     ) -> None:
         """Handle ``ns:<session_name>:<label>`` button callbacks from session results."""
         parsed = parse_ns_callback(data)
         if parsed is None:
             return
         session_name, label = parsed
+        prompt = build_button_followup_prompt(self._message_text_for_callback(msg), label)
 
         async with self._sequential.get_lock(key.lock_key):
-            if self._config.streaming.enabled:
-                from ductor_bot.orchestrator.flows import named_session_streaming
-
-                result = await named_session_streaming(self._orch, key, session_name, label)
-            else:
-                from ductor_bot.orchestrator.flows import named_session_flow
-
-                result = await named_session_flow(self._orch, key, session_name, label)
-
-            if result.text:
+            try:
+                task_id = self._orch.submit_named_followup_bg(
+                    key.chat_id,
+                    session_name,
+                    prompt,
+                    msg.message_id,
+                    thread_id,
+                )
+            except ValueError as exc:
                 await send_rich(
                     self._bot,
                     key.chat_id,
-                    result.text,
+                    str(exc),
                     SendRichOpts(
                         allowed_roots=self.file_roots(self._orch.paths),
                         thread_id=thread_id,
                     ),
                 )
+                return
+
+            await send_rich(
+                self._bot,
+                key.chat_id,
+                fmt(
+                    f"**[{session_name}] Follow-up sent**",
+                    SEP,
+                    f"Task `{task_id}` queued.",
+                ),
+                SendRichOpts(
+                    allowed_roots=self.file_roots(self._orch.paths),
+                    thread_id=thread_id,
+                ),
+            )
+
+    def _message_text_for_callback(self, msg: Message) -> str | None:
+        """Return visible message text/caption for callback-context prompts."""
+        return (
+            getattr(msg, "text", None)
+            or getattr(msg, "caption", None)
+            or getattr(msg, "html_text", None)
+            or getattr(msg, "html_caption", None)
+        )
 
     async def _handle_file_browser(
         self, key: SessionKey, message_id: int, data: str, *, thread_id: int | None = None
@@ -1316,11 +1396,14 @@ class TelegramBot:
             )
         if not message.text:
             return None
-        if is_group:
-            if self._is_for_others(message):
-                return None
-            if self._config.group_mention_only and not self._is_addressed(message):
-                return None
+        if self._is_bot_command_message(message):
+            logger.debug("Ignoring bot command in generic message handler text=%s", message.text[:80])
+            return None
+        if is_group and (
+            self._is_for_others(message)
+            or (self._config.group_mention_only and not self._is_addressed(message))
+        ):
+            return None
         return strip_mention(message.text, self._bot_username)
 
     async def _handle_streaming(

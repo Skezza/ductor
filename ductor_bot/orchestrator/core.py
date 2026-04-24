@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -29,8 +30,10 @@ from ductor_bot.infra.inflight import InflightTracker
 from ductor_bot.orchestrator.commands import (
     cmd_cron,
     cmd_diagnose,
+    cmd_implement,
     cmd_memory,
     cmd_model,
+    cmd_plan,
     cmd_reset,
     cmd_sessions,
     cmd_status,
@@ -41,8 +44,6 @@ from ductor_bot.orchestrator.directives import parse_directives
 from ductor_bot.orchestrator.flows import (
     StreamingCallbacks,
     heartbeat_flow,
-    named_session_flow,
-    named_session_streaming,
     normal,
     normal_streaming,
 )
@@ -58,7 +59,7 @@ from ductor_bot.orchestrator.registry import CommandRegistry, OrchestratorResult
 from ductor_bot.security import detect_suspicious_patterns
 from ductor_bot.session import SessionKey, SessionManager
 from ductor_bot.session.manager import SessionData
-from ductor_bot.session.named import NamedSessionRegistry
+from ductor_bot.session.named import NamedSession, NamedSessionRegistry, suggest_name
 from ductor_bot.webhook.manager import WebhookManager
 from ductor_bot.workspace.paths import DuctorPaths
 
@@ -68,7 +69,6 @@ if TYPE_CHECKING:
     from ductor_bot.config import ModelRegistry
     from ductor_bot.multiagent.bus import AsyncInterAgentResult
     from ductor_bot.multiagent.supervisor import AgentSupervisor
-    from ductor_bot.session.named import NamedSession
     from ductor_bot.tasks.hub import TaskHub
 
 logger = logging.getLogger(__name__)
@@ -330,22 +330,6 @@ class Orchestrator:
 
         directives = parse_directives(dispatch.text, self._providers._known_model_ids)
 
-        # Check if a leading @directive matches a named session
-        if directives.raw_directives:
-            first_key = next(iter(directives.raw_directives))
-            ns = self._named_sessions.get(dispatch.key.chat_id, first_key)
-            if ns is not None:
-                session_prompt = directives.cleaned or dispatch.text
-                if dispatch.streaming:
-                    return await named_session_streaming(
-                        self,
-                        dispatch.key,
-                        first_key,
-                        session_prompt,
-                        cbs=dispatch.streaming_callbacks(),
-                    )
-                return await named_session_flow(self, dispatch.key, first_key, session_prompt)
-
         if directives.is_directive_only and directives.has_model:
             return OrchestratorResult(
                 text=f"Next message will use: {directives.model}\n"
@@ -382,6 +366,10 @@ class Orchestrator:
         reg.register_async("/cron", cmd_cron)
         reg.register_async("/diagnose", cmd_diagnose)
         reg.register_async("/upgrade", cmd_upgrade)
+        reg.register_async("/plan", cmd_plan)
+        reg.register_async("/plan ", cmd_plan)
+        reg.register_async("/implement", cmd_implement)
+        reg.register_async("/implement ", cmd_implement)
         reg.register_async("/sessions", cmd_sessions)
         reg.register_async("/tasks", cmd_tasks)
 
@@ -505,6 +493,9 @@ class Orchestrator:
             session_name=ns.name,
             provider_override=provider_name,
             model_override=model_name,
+            working_dir=ns.working_dir,
+            source_kind=ns.source_kind,
+            planner_mode=ns.planner_mode,
         )
         task_id = self._observers.background.submit(sub, exec_config)
         return task_id, ns.name
@@ -546,6 +537,9 @@ class Orchestrator:
             resume_session_id=ns.session_id,
             provider_override=ns.provider,
             model_override=ns.model,
+            working_dir=ns.working_dir,
+            source_kind=ns.source_kind,
+            planner_mode=ns.planner_mode,
         )
         return self._observers.background.submit(sub, exec_config)
 
@@ -578,6 +572,24 @@ class Orchestrator:
         """List active named sessions for a chat."""
         return self._named_sessions.list_active(chat_id)
 
+    async def set_main_planner_state(
+        self,
+        key: SessionKey,
+        *,
+        provider: str,
+        model: str,
+        enabled: bool | None = None,
+        waiting: bool | None = None,
+    ) -> SessionData:
+        """Persist planner flags for the main foreground session target."""
+        return await self._sessions.set_planner_state(
+            key,
+            provider=provider,
+            model=model,
+            enabled=enabled,
+            waiting=waiting,
+        )
+
     async def list_topic_sessions(self, chat_id: int) -> list[SessionData]:
         """Return fresh topic sessions for *chat_id*."""
         all_sessions = await self._sessions.list_active_for_chat(chat_id)
@@ -588,6 +600,98 @@ class Orchestrator:
         if self._observers.background is None:
             return []
         return self._observers.background.active_tasks(chat_id)
+
+    def codex_import_uses_docker(self) -> bool:
+        """Return True when imported Codex sessions would execute in Docker mode."""
+        return self._config.docker.enabled
+
+    def codex_import_model(self) -> str:
+        """Return the model label used for imported Codex session metadata."""
+        model = self.default_model_for_provider("codex")
+        if model:
+            return model
+        current_model, current_provider = self.resolve_runtime_target(self._config.model)
+        if current_provider == "codex":
+            return current_model
+        return "codex"
+
+    async def attach_codex_import(
+        self,
+        key: SessionKey,
+        *,
+        session_id: str,
+        working_dir: str,
+    ) -> SessionData:
+        """Attach an imported Codex session to the current chat/topic."""
+        return await self._sessions.set_provider_session_state(
+            key,
+            provider="codex",
+            model=self.codex_import_model(),
+            session_id=session_id,
+            working_dir=working_dir,
+            source_kind="codex_import",
+        )
+
+    async def start_fresh_codex_session(
+        self,
+        key: SessionKey,
+        *,
+        working_dir: str,
+    ) -> SessionData:
+        """Prepare a brand-new Codex session in the selected project directory."""
+        return await self._sessions.set_provider_session_state(
+            key,
+            provider="codex",
+            model=self.codex_import_model(),
+            session_id="",
+            working_dir=working_dir,
+            source_kind="ductor",
+        )
+
+    async def mark_codex_import_unavailable(self, key: SessionKey) -> SessionData:
+        """Keep an imported Codex bucket present but blocked until re-imported."""
+        active = await self._sessions.get_active(key)
+        model_name = self.codex_import_model()
+        working_dir = ""
+        if active is not None and "codex" in active.provider_sessions:
+            model_name = active.model if active.provider == "codex" else model_name
+            working_dir = active.provider_sessions["codex"].working_dir
+        return await self._sessions.set_provider_session_state(
+            key,
+            provider="codex",
+            model=model_name,
+            session_id="",
+            working_dir=working_dir,
+            source_kind="codex_import",
+        )
+
+    def import_codex_named_session(
+        self,
+        chat_id: int,
+        *,
+        session_id: str,
+        working_dir: str,
+        thread_name: str,
+        prompt_preview: str,
+    ) -> NamedSession:
+        """Create an idle named session from imported Codex metadata."""
+        active = self._named_sessions.active_names(chat_id)
+        base_name = thread_name.strip() or prompt_preview.strip() or "codex"
+        name = suggest_name(base_name, active)
+        session = NamedSession(
+            name=name,
+            chat_id=chat_id,
+            provider="codex",
+            model=self.codex_import_model(),
+            session_id=session_id,
+            prompt_preview=prompt_preview[:60],
+            status="idle",
+            created_at=time.time(),
+            working_dir=working_dir,
+            source_kind="codex_import",
+        )
+        self._named_sessions.add(session)
+        return session
 
     def is_chat_busy(self, chat_id: int, topic_id: int | None = None) -> bool:
         """Check if a chat has active CLI processes."""

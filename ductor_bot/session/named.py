@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import secrets
 import time
 from dataclasses import asdict, dataclass
@@ -110,6 +111,7 @@ _NOUNS: tuple[str, ...] = (
 MAX_SESSIONS_PER_CHAT = 10
 
 _MAX_NAME_ATTEMPTS = 50
+_MAX_IMPORTED_NAME_LENGTH = 24
 
 
 def generate_name(existing: set[str]) -> str:
@@ -128,6 +130,22 @@ def generate_name(existing: set[str]) -> str:
     raise RuntimeError(msg)
 
 
+def suggest_name(raw: str, existing: set[str]) -> str:
+    """Build a compact deterministic session name from user-visible text."""
+    slug = re.sub(r"[^a-z0-9]+", "", raw.lower())
+    if not slug:
+        return generate_name(existing)
+    slug = slug[:_MAX_IMPORTED_NAME_LENGTH]
+    if slug not in existing:
+        return slug
+    for i in range(2, 100):
+        suffix = str(i)
+        candidate = f"{slug[: max(1, _MAX_IMPORTED_NAME_LENGTH - len(suffix))]}{suffix}"
+        if candidate not in existing:
+            return candidate
+    return generate_name(existing)
+
+
 @dataclass(slots=True)
 class NamedSession:
     """State for a named background session."""
@@ -143,6 +161,10 @@ class NamedSession:
     message_count: int = 0
     last_prompt: str = ""
     transport: str = "tg"
+    working_dir: str = ""
+    source_kind: str = "ductor"
+    planner_mode: bool = False
+    planner_waiting: bool = False
 
 
 def _session_from_dict(data: dict[str, Any]) -> NamedSession:
@@ -159,6 +181,10 @@ def _session_from_dict(data: dict[str, Any]) -> NamedSession:
         message_count=int(data.get("message_count", 0)),
         last_prompt=str(data.get("last_prompt", data.get("prompt_preview", ""))),
         transport=str(data.get("transport", "tg")),
+        working_dir=str(data.get("working_dir", "")),
+        source_kind=str(data.get("source_kind", "ductor")),
+        planner_mode=bool(data.get("planner_mode", False)),
+        planner_waiting=bool(data.get("planner_waiting", False)),
     )
 
 
@@ -200,8 +226,14 @@ class NamedSessionRegistry:
                     created_at=ns.created_at,
                     message_count=ns.message_count,
                     last_prompt=ns.last_prompt,
+                    transport=ns.transport,
+                    working_dir=ns.working_dir,
+                    source_kind=ns.source_kind,
+                    planner_mode=ns.planner_mode,
+                    planner_waiting=False,
                 )
                 ns.status = "idle"
+                ns.planner_waiting = False
             self._sessions[(ns.chat_id, ns.name)] = ns
         logger.info("Loaded %d named sessions from %s", len(self._sessions), self._path)
 
@@ -293,6 +325,7 @@ class NamedSessionRegistry:
             ns.session_id = session_id
         ns.message_count += 1
         ns.status = status
+        ns.planner_waiting = False
         self._persist()
 
     def add(self, session: NamedSession) -> None:
@@ -304,6 +337,16 @@ class NamedSessionRegistry:
         self._sessions[(session.chat_id, session.name)] = session
         self._persist()
 
+    def set_status(self, chat_id: int, name: str, status: str) -> None:
+        """Update status without mutating counters or session identity."""
+        ns = self._sessions.get((chat_id, name))
+        if ns is None:
+            return
+        ns.status = status
+        if status != "running":
+            ns.planner_waiting = False
+        self._persist()
+
     def mark_running(self, chat_id: int, name: str, prompt: str) -> None:
         """Mark a session as running and store the prompt for recovery."""
         ns = self._sessions.get((chat_id, name))
@@ -311,6 +354,17 @@ class NamedSessionRegistry:
             return
         ns.status = "running"
         ns.last_prompt = prompt[:4000]
+        ns.planner_waiting = ns.planner_mode
+        self._persist()
+
+    def set_planner_mode(self, chat_id: int, name: str, enabled: bool) -> None:
+        """Enable or disable sticky planner mode for a named session."""
+        ns = self._sessions.get((chat_id, name))
+        if ns is None:
+            return
+        ns.planner_mode = enabled
+        if not enabled:
+            ns.planner_waiting = False
         self._persist()
 
     def pop_recovered_running(self, chat_id: int | None = None) -> list[NamedSession]:

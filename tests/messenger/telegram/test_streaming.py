@@ -90,7 +90,20 @@ class TestStreamEditor:
         await editor.append_tool("SearchTool")
         bot.send_message.assert_called_once()
         call_text = bot.send_message.call_args.kwargs["text"]
-        assert "SearchTool" in call_text
+        assert "Using search tool" in call_text
+
+    async def test_append_system_sends_human_status_message(self) -> None:
+        from ductor_bot.messenger.telegram.streaming import StreamEditor
+
+        bot = MagicMock()
+        sent_msg = MagicMock(spec=Message)
+        bot.send_message = AsyncMock(return_value=sent_msg)
+
+        editor = StreamEditor(bot, chat_id=1)
+        await editor.append_system("recovering")
+        bot.send_message.assert_called_once()
+        call_text = bot.send_message.call_args.kwargs["text"]
+        assert "Recovering session" in call_text
 
     async def test_empty_text_not_sent(self) -> None:
         from ductor_bot.messenger.telegram.streaming import StreamEditor

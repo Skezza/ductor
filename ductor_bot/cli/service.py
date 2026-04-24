@@ -70,7 +70,7 @@ class _StreamCallbacks:
                 event.pre_tokens,
             )
             if self._on_status is not None:
-                await self._on_status(None)
+                await self._on_status("compacting")
         elif isinstance(event, ResultEvent):
             return "", event
         return "", None
@@ -310,7 +310,7 @@ class CLIService:
         return create_cli(
             CLIConfig(
                 provider=provider,
-                working_dir=self._config.working_dir,
+                working_dir=request.working_dir_override or self._config.working_dir,
                 model=model,
                 system_prompt=request.system_prompt,
                 append_system_prompt=request.append_system_prompt,

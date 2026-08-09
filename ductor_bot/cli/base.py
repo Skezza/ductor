@@ -93,6 +93,7 @@ class CLIConfig:
     chat_id: int = 0
     topic_id: int | None = None
     process_label: str = "main"
+    parent_prompt: str = ""
     # Gemini-specific auth fallback:
     gemini_api_key: str | None = None
     # Extra CLI parameters (provider-specific):
@@ -172,6 +173,8 @@ def docker_wrap(
             f"DUCTOR_AGENT_NAME={config.agent_name}",
             "-e",
             f"DUCTOR_INTERAGENT_PORT={config.interagent_port}",
+            "-e",
+            f"DUCTOR_PARENT_PROMPT={config.parent_prompt}",
             "-e",
             f"DUCTOR_HOME={container_home}",
             "-e",

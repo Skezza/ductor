@@ -324,6 +324,7 @@ class CLIService:
                 chat_id=request.chat_id,
                 topic_id=request.topic_id,
                 process_label=request.process_label,
+                parent_prompt=request.prompt,
                 cli_parameters=self._config.cli_parameters_for_provider(provider),
                 agent_name=self._config.agent_name,
                 interagent_port=self._config.interagent_port,

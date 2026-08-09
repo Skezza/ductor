@@ -103,6 +103,8 @@ class CodexCLI(BaseCLI):
         if json_output:
             cmd.append("--json")
         cmd += self._sandbox_flags()
+        if self._config.reasoning_effort and self._config.reasoning_effort != "default":
+            cmd += ["-c", f"model_reasoning_effort={self._config.reasoning_effort}"]
         cmd += ["--", session_id]
         if not _IS_WINDOWS:
             cmd.append(final_prompt)

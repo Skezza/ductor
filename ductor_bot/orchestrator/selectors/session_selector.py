@@ -314,10 +314,24 @@ def _project_page_slice(browser: CodexHistoryBrowser, page: int) -> tuple[int, t
 def _session_page_slice(
     project: CodexHistoryProject,
     page: int,
-) -> tuple[int, tuple[CodexHistorySession, ...]]:
+) -> tuple[tuple[int, CodexHistorySession], ...]:
+    browseable = tuple(
+        (session_index, session)
+        for session_index, session in enumerate(project.sessions)
+        if not session.is_ductor_task and not session.is_subagent
+    )
     start = max(0, page) * _SESSIONS_PER_PAGE
     stop = start + _SESSIONS_PER_PAGE
-    return start, project.sessions[start:stop]
+    return browseable[start:stop]
+
+
+def _browseable_session_count(project: CodexHistoryProject) -> int:
+    """Return the number of normal Codex sessions shown in Browse Codex."""
+    return sum(
+        1
+        for session in project.sessions
+        if not session.is_ductor_task and not session.is_subagent
+    )
 
 
 def _selected_project(
@@ -367,14 +381,25 @@ def _codex_session_title(session: CodexHistorySession) -> str:
         return f"(Task) {title}"
     if session.is_subagent:
         return f"(Agent) {title}"
-    return f"(D) {title}" if session.is_ductor_touched else title
+    return f"(D) {title}" if session.is_ductor_touched else f"(PC) {title}"
 
 
 def _codex_session_mix(project: CodexHistoryProject) -> str:
     task_count = sum(1 for session in project.sessions if session.is_ductor_task)
     agent_count = sum(1 for session in project.sessions if session.is_subagent)
-    human_count = max(0, len(project.sessions) - task_count - agent_count)
-    return f"H:{human_count} T:{task_count} A:{agent_count}"
+    ductor_count = sum(
+        1
+        for session in project.sessions
+        if session.is_ductor_touched and not session.is_ductor_task and not session.is_subagent
+    )
+    pc_count = max(0, len(project.sessions) - task_count - agent_count - ductor_count)
+    hidden: list[str] = []
+    if task_count:
+        hidden.append(f"{task_count} task{'s' if task_count != 1 else ''} hidden")
+    if agent_count:
+        hidden.append(f"{agent_count} agent{'s' if agent_count != 1 else ''} hidden")
+    visible = f"PC:{pc_count} D:{ductor_count}"
+    return f"{visible} ({', '.join(hidden)})" if hidden else visible
 
 
 def _codex_session_snippet_line(session: CodexHistorySession) -> str:
@@ -410,22 +435,6 @@ def _codex_session_entry_button(
         text=f"{label}. {_codex_session_title(session)[:22]}",
         callback_data=callback_data,
     )
-
-
-def _recent_background_task_entries(
-    project: CodexHistoryProject,
-    visible_indexes: set[int],
-    *,
-    limit: int = 3,
-) -> tuple[tuple[int, CodexHistorySession], ...]:
-    entries: list[tuple[int, CodexHistorySession]] = []
-    for session_index, session in enumerate(project.sessions):
-        if session_index in visible_indexes or not session.is_ductor_task:
-            continue
-        entries.append((session_index, session))
-        if len(entries) >= limit:
-            break
-    return tuple(entries)
 
 
 async def _build_root_page(  # noqa: C901, PLR0912
@@ -550,7 +559,7 @@ async def _build_codex_projects_page(
         project_index = start + offset
         lines.append(
             f"  {project_index + 1}. **{project.label}**"
-            f" | {len(project.sessions)} | {_codex_session_mix(project)}"
+            f" | {_browseable_session_count(project)} | {_codex_session_mix(project)}"
             f" | {_format_updated_age(project.updated_ts)}"
         )
         lines.append(f"     `{_clip_text(project.working_dir, _PROJECT_PATH_LIMIT)}`")
@@ -641,12 +650,13 @@ async def _build_codex_sessions_page(
     if project is None:
         return await _build_codex_projects_page(page=0, note=t("sessions.unknown_action"))
 
-    start, sessions = _session_page_slice(project, page)
+    session_entries = _session_page_slice(project, page)
+    browseable_count = _browseable_session_count(project)
     project_page = project_index // _PROJECTS_PER_PAGE
     lines = [
         f"**{project.label}**",
         f"`{_clip_text(project.working_dir, _PROJECT_PATH_LIMIT)}`",
-        f"{_codex_session_mix(project)} | D=Ductor T=Task A=Agent",
+        f"{_codex_session_mix(project)} | (PC)=Personal Codex (D)=Ductor",
     ]
     rows: list[list[Button]] = [
         [
@@ -656,11 +666,8 @@ async def _build_codex_sessions_page(
             )
         ]
     ]
-    visible_session_indexes: set[int] = set()
-    for offset, session in enumerate(sessions):
-        session_index = start + offset
-        visible_session_indexes.add(session_index)
-        label = str(session_index + 1)
+    for display_index, (session_index, session) in enumerate(session_entries, 1):
+        label = str((page * _SESSIONS_PER_PAGE) + display_index)
         lines.extend(_codex_session_entry_lines(session, label=label))
         rows.append(
             [
@@ -675,31 +682,11 @@ async def _build_codex_sessions_page(
         )
 
 
-    if page == 0:
-        recent_tasks = _recent_background_task_entries(project, visible_session_indexes)
-        if recent_tasks:
-            lines.append("")
-            lines.append("Recent background tasks:")
-            for task_number, (session_index, session) in enumerate(recent_tasks, 1):
-                label = f"Task {task_number}"
-                lines.extend(_codex_session_entry_lines(session, label=label))
-                rows.append(
-                    [
-                        _codex_session_entry_button(
-                            session,
-                            label=label,
-                            callback_data=(
-                                f"nsc:cxd:{project_index}:{session_index}:{project_page}:{page}"
-                            ),
-                        )
-                    ]
-                )
-
     footer_lines = [
         t(
             "sessions.codex_page",
             current=page + 1,
-            total=_total_pages(len(project.sessions), _SESSIONS_PER_PAGE),
+            total=_total_pages(browseable_count, _SESSIONS_PER_PAGE),
         )
     ]
     if note:
@@ -719,7 +706,7 @@ async def _build_codex_sessions_page(
         nav_row.append(
             Button(text=t("sessions.btn_prev"), callback_data=f"nsc:cxs:{project_index}:{page - 1}")
         )
-    if (page + 1) * _SESSIONS_PER_PAGE < len(project.sessions):
+    if (page + 1) * _SESSIONS_PER_PAGE < browseable_count:
         nav_row.append(
             Button(text=t("sessions.btn_next"), callback_data=f"nsc:cxs:{project_index}:{page + 1}")
         )

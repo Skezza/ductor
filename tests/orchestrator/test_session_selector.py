@@ -153,7 +153,7 @@ async def test_project_page_shows_start_fresh_button(
     assert "assistant summary" in resp.text
 
 
-async def test_codex_sessions_page_surfaces_task_rows_when_hidden_by_human_sort(
+async def test_codex_sessions_page_hides_background_task_rows(
     orch: Orchestrator,
     monkeypatch,
 ) -> None:
@@ -164,16 +164,16 @@ async def test_codex_sessions_page_surfaces_task_rows_when_hidden_by_human_sort(
 
     resp = await handle_session_callback(orch, SessionKey(chat_id=1), "nsc:cxs:0:0")
 
-    assert "H:6 T:2 A:0" in resp.text
-    assert "D=Ductor T=Task A=Agent" in resp.text
-    assert "Recent background tasks:" in resp.text
-    assert "Task 1. (Task) Review how kit bitmaps work" in resp.text
-    assert "Task 2. (Task) PM99 metadata335 isolated apply runner smoke" in resp.text
+    assert "PC:6 D:0 (2 tasks hidden)" in resp.text
+    assert "(PC)=Personal Codex (D)=Ductor" in resp.text
+    assert "Recent background tasks:" not in resp.text
+    assert "(Task) Review how kit bitmaps work" not in resp.text
+    assert "(Task) PM99 metadata335 isolated apply runner smoke" not in resp.text
     assert "first prompt for Review how kit bitmaps work" not in resp.text
     assert resp.buttons is not None
     labels = [button.text for row in resp.buttons.rows for button in row]
-    assert any(label.startswith("Task 1. (Task)") for label in labels)
-    assert any(label.startswith("Task 2. (Task)") for label in labels)
+    assert not any("Review how kit bitmaps work" in label for label in labels)
+    assert not any("PM99 metadata335" in label for label in labels)
 
 
 async def test_codex_sessions_page_marks_ductor_touched_sessions(
@@ -193,7 +193,24 @@ async def test_codex_sessions_page_marks_ductor_touched_sessions(
     assert any("(D) Imported thread" in label for label in labels)
 
 
-async def test_codex_sessions_page_marks_task_sessions_separately(
+async def test_codex_sessions_page_marks_personal_codex_sessions(
+    orch: Orchestrator,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "ductor_bot.orchestrator.selectors.session_selector.load_codex_history_browser",
+        lambda: _browser(str(orch.paths.workspace)),
+    )
+
+    resp = await handle_session_callback(orch, SessionKey(chat_id=1), "nsc:cxs:0:0")
+
+    assert "(PC) Imported thread" in resp.text
+    assert resp.buttons is not None
+    labels = [button.text for row in resp.buttons.rows for button in row]
+    assert any("(PC) Imported thread" in label for label in labels)
+
+
+async def test_codex_sessions_page_hides_task_sessions(
     orch: Orchestrator,
     monkeypatch,
 ) -> None:
@@ -208,8 +225,9 @@ async def test_codex_sessions_page_marks_task_sessions_separately(
 
     resp = await handle_session_callback(orch, SessionKey(chat_id=1), "nsc:cxs:0:0")
 
-    assert "(Task) Imported thread" in resp.text
+    assert "(Task) Imported thread" not in resp.text
     assert "(D) Imported thread" not in resp.text
+    assert "1 task hidden" in resp.text
 
 
 async def test_attach_codex_import_updates_current_chat_provider_bucket(
@@ -554,6 +572,6 @@ async def test_browser_desktop_resume_page_shows_exact_command(
 
     resp = await handle_session_callback(orch, SessionKey(chat_id=1), "nsc:cxdc:0:0:0:0")
 
-    assert "Target: Imported thread" in resp.text
+    assert "Target: (PC) Imported thread" in resp.text
     assert "codex resume --include-non-interactive --all --cd" in resp.text
     assert "sess-import-1" in resp.text
